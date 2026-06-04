@@ -133,11 +133,21 @@ func parseArgs() opts {
 	flag.BoolVar  (&o.All,          "all",           false, "Show GPOs with no findings")
 	flag.BoolVar  (&o.Verbose,      "v",             false, "Verbose output")
 	flag.Parse()
-	if flag.NArg() < 1 || o.Domain == "" || o.Username == "" {
+	// Permute args so flags work in any position. Go's flag package stops at the
+	// first non-flag arg, so `gpo-enum ... <DC> -proxy URL` would silently drop
+	// -proxy. Pull positionals off one at a time and re-parse the remainder.
+	var positionals []string
+	for rest := flag.Args(); len(rest) > 0; rest = flag.Args() {
+		positionals = append(positionals, rest[0])
+		if err := flag.CommandLine.Parse(rest[1:]); err != nil {
+			os.Exit(2)
+		}
+	}
+	if len(positionals) < 1 || o.Domain == "" || o.Username == "" {
 		fmt.Fprintln(os.Stderr, "usage: gpo-enum -u USER -p PASS -d DOMAIN [-target-domain DOMAIN] [-H LM:NT] [-k] [-dc-ip IP] [-proxy URL] [-o FILE] [-policy NAME|GUID] [-all] [-v] <DC>")
 		os.Exit(1)
 	}
-	o.DC = flag.Arg(0)
+	o.DC = positionals[0]
 	if o.DCIP == "" {
 		o.DCIP = o.DC
 	}
