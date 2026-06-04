@@ -72,7 +72,7 @@ const banner = cLime + cBold + `
   ║` + cReset + cPurple + `  GPO Enumerator  //  red team use only                             ` + cLime + cBold + `║
   ╚════════════════════════════════════════════════════════════════════════╝` + cReset + "\n"
 
-func ts() string { return cGrey + time.Now().UTC().Format("15:04:05") + cReset + " " }
+func ts() string { return cGrey + time.Now().UTC().Format("2006-01-02 15:04:05 UTC --") + cReset + " " }
 
 func info(f string, a ...any) { fmt.Printf(ts()+cLime+"[*]"+cReset+" "+f+"\n", a...) }
 func good(f string, a ...any) { fmt.Printf(ts()+cLime+"[+]"+cReset+" "+f+"\n", a...) }
@@ -1623,7 +1623,7 @@ func truncate(s string, n int) string {
 // ─────────────────────────────────────────────────────────────
 
 func main() {
-	stamp := time.Now().Format("20060102_150405")
+	stamp := time.Now().UTC().Format("20060102_150405")
 	fmt.Print(banner)
 	o := parseArgs()
 
