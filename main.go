@@ -118,6 +118,14 @@ func (o *opts) sysvol() string {
 	return o.Domain
 }
 
+// looksLikeGUID reports whether s is a bare GPO GUID (8-4-4-4-12 hex, optional
+// braces) — as opposed to a display-name substring passed to -policy.
+var guidRe = regexp.MustCompile(`^\{?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}?$`)
+
+func looksLikeGUID(s string) bool {
+	return guidRe.MatchString(s)
+}
+
 func parseArgs() opts {
 	var o opts
 	flag.StringVar(&o.Domain,       "d",             "",    "Auth domain (e.g. corp.local)")
@@ -294,12 +302,20 @@ type gpoMeta struct {
 }
 
 // getGPONames queries LDAP for all GPO display names, keyed by lowercase GUID.
-func getGPONames(lc *ldapConn) (map[string]gpoMeta, error) {
+// getGPONames resolves GPO display names from LDAP. If guid is non-empty, only
+// that GPO is resolved (an indexed cn= lookup) rather than the whole container —
+// avoids pulling every GPO when the caller already knows the target (-policy GUID).
+func getGPONames(lc *ldapConn, guid string) (map[string]gpoMeta, error) {
 	out := map[string]gpoMeta{}
+
+	filter := "(objectClass=groupPolicyContainer)"
+	if guid != "" {
+		filter = fmt.Sprintf("(&(objectClass=groupPolicyContainer)(cn={%s}))", guid)
+	}
 
 	searchBase := "CN=Policies,CN=System," + lc.baseDN
 	results, err := lc.conn.Search(searchBase,
-		"(objectClass=groupPolicyContainer)",
+		filter,
 		[]string{"cn", "displayName", "flags", "versionNumber"},
 	)
 	if err != nil {
@@ -318,11 +334,19 @@ func getGPONames(lc *ldapConn) (map[string]gpoMeta, error) {
 }
 
 // getGPOLinks returns a map of GUID → slice of linked OU DNs.
-func getGPOLinks(lc *ldapConn) (map[string][]string, error) {
+// getGPOLinks builds a GPO-GUID → linking-OU/domain map from gPLink attributes.
+// If guid is non-empty, only containers linking that specific GPO are returned
+// (substring filter on the gPLink value) instead of scanning every linked OU.
+func getGPOLinks(lc *ldapConn, guid string) (map[string][]string, error) {
 	out := map[string][]string{}
 
+	filter := "(gPLink=*)"
+	if guid != "" {
+		filter = fmt.Sprintf("(gPLink=*{%s}*)", guid)
+	}
+
 	results, err := lc.conn.Search(lc.baseDN,
-		"(gPLink=*)",
+		filter,
 		[]string{"distinguishedName", "gPLink"},
 	)
 	if err != nil {
@@ -1679,8 +1703,19 @@ func main() {
 	fmt.Printf("  %s%sStarted%s : %s\n", cBold, cWhite, cReset, ts)
 	fmt.Println()
 
+	// If -policy is a bare GUID we already know the target, so resolve only that
+	// one GPO from LDAP (and only its links) instead of the whole container.
+	policyGUID := ""
+	if o.Policy != "" && looksLikeGUID(o.Policy) {
+		policyGUID = strings.ToUpper(strings.Trim(o.Policy, "{}"))
+	}
+
 	// ── LDAP connection for GPO name resolution
-	info("Resolving GPO names via LDAP...")
+	if policyGUID != "" {
+		info("Resolving target GPO name via LDAP...")
+	} else {
+		info("Resolving GPO names via LDAP...")
+	}
 	lc, err := connectLDAP(o)
 	if err != nil {
 		warn("LDAP failed (%v) — will use GUIDs only", err)
@@ -1690,57 +1725,74 @@ func main() {
 	gpoNames := map[string]gpoMeta{}
 	gpoLinks := map[string][]string{}
 	if lc != nil {
-		gpoNames, _ = getGPONames(lc)
-		gpoLinks, _  = getGPOLinks(lc)
+		gpoNames, _ = getGPONames(lc, policyGUID)
+		gpoLinks, _  = getGPOLinks(lc, policyGUID)
 		lc.conn.Close()
-		good("Resolved %d GPO display names from LDAP", len(gpoNames))
+		if policyGUID != "" {
+			good("Resolved target GPO from LDAP")
+		} else {
+			good("Resolved %d GPO display names from LDAP", len(gpoNames))
+		}
 	}
 
 	// ── Enumerate SYSVOL\<domain>\Policies
 	policiesPath := fmt.Sprintf("%s\\Policies", o.sysvol())
-	info("Enumerating SYSVOL: \\\\%s\\SYSVOL\\%s", o.DC, policiesPath)
-
-	topEntries, err := smbs.listDir(policiesPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, cRed+"[-]"+cReset+" Failed to list Policies: %v\n", err)
-		os.Exit(1)
-	}
 
 	type gpoDir struct {
 		GUID string
 		Path string
 	}
 	var gpoDirs []gpoDir
-	for _, e := range topEntries {
-		name := e.Name()
-		if name == "." || name == ".." || !e.IsDir() {
-			continue
-		}
-		guid := strings.ToLower(strings.Trim(name, "{}"))
-		gpoDirs = append(gpoDirs, gpoDir{
-			GUID: guid,
-			Path: policiesPath + "\\" + name,
-		})
-	}
-	good("Found %d GPO directories in SYSVOL", len(gpoDirs))
 
-	// ── Filter to a single policy if requested
-	if o.Policy != "" {
-		needle := strings.ToLower(strings.Trim(o.Policy, "{}"))
-		var filtered []gpoDir
-		for _, gd := range gpoDirs {
-			guidMatch := strings.Contains(gd.GUID, needle)
-			nameMatch := strings.Contains(strings.ToLower(gpoNames[gd.GUID].DisplayName), needle)
-			if guidMatch || nameMatch {
-				filtered = append(filtered, gd)
-			}
-		}
-		if len(filtered) == 0 {
-			fmt.Fprintf(os.Stderr, cRed+"[-]"+cReset+" No GPO matched -policy %q\n", o.Policy)
+	if policyGUID != "" {
+		// Target the GPO's SYSVOL directory directly — no need to list (and walk)
+		// every policy folder just to find one. SMB paths are case-insensitive.
+		dirName := "{" + policyGUID + "}"
+		target := policiesPath + "\\" + dirName
+		info("Targeting SYSVOL GPO: \\\\%s\\SYSVOL\\%s", o.DC, target)
+		if _, err := smbs.listDir(target); err != nil {
+			fmt.Fprintf(os.Stderr, cRed+"[-]"+cReset+" GPO %s not found in SYSVOL: %v\n", dirName, err)
 			os.Exit(1)
 		}
-		info("Filtering to %d matching GPO(s) for -policy %q", len(filtered), o.Policy)
-		gpoDirs = filtered
+		gpoDirs = append(gpoDirs, gpoDir{GUID: strings.ToLower(policyGUID), Path: target})
+	} else {
+		info("Enumerating SYSVOL: \\\\%s\\SYSVOL\\%s", o.DC, policiesPath)
+		topEntries, err := smbs.listDir(policiesPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, cRed+"[-]"+cReset+" Failed to list Policies: %v\n", err)
+			os.Exit(1)
+		}
+		for _, e := range topEntries {
+			name := e.Name()
+			if name == "." || name == ".." || !e.IsDir() {
+				continue
+			}
+			guid := strings.ToLower(strings.Trim(name, "{}"))
+			gpoDirs = append(gpoDirs, gpoDir{
+				GUID: guid,
+				Path: policiesPath + "\\" + name,
+			})
+		}
+		good("Found %d GPO directories in SYSVOL", len(gpoDirs))
+
+		// ── Filter by display name or partial GUID (the non-bare-GUID -policy case)
+		if o.Policy != "" {
+			needle := strings.ToLower(strings.Trim(o.Policy, "{}"))
+			var filtered []gpoDir
+			for _, gd := range gpoDirs {
+				guidMatch := strings.Contains(gd.GUID, needle)
+				nameMatch := strings.Contains(strings.ToLower(gpoNames[gd.GUID].DisplayName), needle)
+				if guidMatch || nameMatch {
+					filtered = append(filtered, gd)
+				}
+			}
+			if len(filtered) == 0 {
+				fmt.Fprintf(os.Stderr, cRed+"[-]"+cReset+" No GPO matched -policy %q\n", o.Policy)
+				os.Exit(1)
+			}
+			info("Filtering to %d matching GPO(s) for -policy %q", len(filtered), o.Policy)
+			gpoDirs = filtered
+		}
 	}
 
 	// ── Walk each GPO
