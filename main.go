@@ -4,11 +4,11 @@
 // No Python, no impacket, no monkey-patching.
 // Compile to a single static binary, drop and run.
 //
-// Build:
-//   go build -trimpath -ldflags="-s -w" -o gpo-enum .
+// Build (vendor required — contains patched gokrb5 for proxy-aware KDC dialing):
+//   CGO_ENABLED=0 go build -mod=vendor -trimpath -ldflags="-s -w" -o gpo-enum .
 //
 // Cross-compile Windows .exe from Linux:
-//   GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o gpo-enum.exe .
+//   GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -mod=vendor -trimpath -ldflags="-s -w" -o gpo-enum.exe .
 //
 // Usage:
 //   ./gpo-enum -u jsmith -p 'Password1' -d corp.local dc01.corp.local
@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -38,8 +39,9 @@ import (
 	"time"
 	"unicode/utf16"
 
-	gsmb      "github.com/mandiant/gopacket/pkg/smb"
-	gldap     "github.com/mandiant/gopacket/pkg/ldap"
+	gokrb5client "github.com/jcmturner/gokrb5/v8/client"
+	gsmb         "github.com/mandiant/gopacket/pkg/smb"
+	gldap        "github.com/mandiant/gopacket/pkg/ldap"
 	"github.com/mandiant/gopacket/pkg/session"
 	"github.com/mandiant/gopacket/pkg/transport"
 )
@@ -1636,6 +1638,9 @@ func main() {
 		if err := transport.Configure(transport.Options{Proxy: o.Proxy}); err != nil {
 			fmt.Fprintf(os.Stderr, cRed+"[-]"+cReset+" Proxy config failed: %v\n", err)
 			os.Exit(1)
+		}
+		gokrb5client.DialTCPFunc = func(addr string, timeout time.Duration) (net.Conn, error) {
+			return transport.DialTimeout("tcp", addr, int(timeout.Seconds()))
 		}
 		info("Proxy: %s", transport.ProxyURL())
 	} else {
