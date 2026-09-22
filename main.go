@@ -458,6 +458,59 @@ func decodeUTF16LE(b []byte) string {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Well-known SID display names (builtin + common)
+// ─────────────────────────────────────────────────────────────
+
+var wellKnownSIDs = map[string]string{
+	"S-1-5-32-544":  "Administrators",
+	"S-1-5-32-545":  "Users",
+	"S-1-5-32-546":  "Guests",
+	"S-1-5-32-547":  "Power Users",
+	"S-1-5-32-548":  "Account Operators",
+	"S-1-5-32-549":  "Server Operators",
+	"S-1-5-32-550":  "Print Operators",
+	"S-1-5-32-551":  "Backup Operators",
+	"S-1-5-32-552":  "Replicators",
+	"S-1-5-32-555":  "Remote Desktop Users",
+	"S-1-5-32-556":  "Network Configuration Operators",
+	"S-1-5-32-558":  "Performance Monitor Users",
+	"S-1-5-32-559":  "Performance Log Users",
+	"S-1-5-32-562":  "Distributed COM Users",
+	"S-1-5-32-568":  "IIS_IUSRS",
+	"S-1-5-32-569":  "Cryptographic Operators",
+	"S-1-5-32-573":  "Event Log Readers",
+	"S-1-5-32-578":  "Hyper-V Administrators",
+	"S-1-5-32-580":  "Remote Management Users",
+	"S-1-1-0":       "Everyone",
+	"S-1-5-11":      "Authenticated Users",
+	"S-1-5-18":      "SYSTEM",
+	"S-1-5-19":      "LOCAL SERVICE",
+	"S-1-5-20":      "NETWORK SERVICE",
+}
+
+var securityGroupSIDs = map[string]bool{
+	"S-1-5-32-544": true,
+	"S-1-5-32-555": true,
+	"S-1-5-32-580": true,
+}
+
+func resolveSID(raw string) string {
+	s := strings.TrimPrefix(strings.TrimSpace(raw), "*")
+	if name, ok := wellKnownSIDs[strings.ToUpper(s)]; ok {
+		return name + " (" + s + ")"
+	}
+	return s
+}
+
+func groupMembershipSeverity(groupSID string) string {
+	sid := strings.TrimPrefix(strings.TrimSpace(groupSID), "*")
+	if securityGroupSIDs[strings.ToUpper(sid)] {
+		return "HIGH"
+	}
+	return "INFO"
+}
+
+// ─────────────────────────────────────────────────────────────
 // GptTmpl.inf parser
 // ─────────────────────────────────────────────────────────────
 
@@ -503,6 +556,27 @@ func parseGptTmpl(data []byte) []Finding {
 			findings = append(findings, Finding{Severity: "HIGH", Description: "Account lockout disabled", Detail: line})
 		case section == "Privilege Rights" && isInterestingPrivilege(k):
 			findings = append(findings, Finding{Severity: "INFO", Description: fmt.Sprintf("[%s] %s", section, k), Detail: line})
+		case section == "Group Membership" && strings.Contains(kl, "__members"):
+			members := strings.TrimSpace(v)
+			if members == "" {
+				continue
+			}
+			groupRaw, _, _ := strings.Cut(k, "__")
+			groupName := resolveSID(groupRaw)
+			isMemberOf := strings.HasSuffix(kl, "__memberof")
+			var resolved []string
+			for _, m := range strings.Split(members, ",") {
+				m = strings.TrimSpace(m)
+				if m != "" {
+					resolved = append(resolved, resolveSID(m))
+				}
+			}
+			desc := fmt.Sprintf("Restricted Groups: %s members → %s", groupName, strings.Join(resolved, ", "))
+			if isMemberOf {
+				desc = fmt.Sprintf("Restricted Groups: %s memberOf → %s", groupName, strings.Join(resolved, ", "))
+			}
+			sev := groupMembershipSeverity(groupRaw)
+			findings = append(findings, Finding{Severity: sev, Description: desc, Detail: line})
 		case section == "Registry Values":
 			// Format: MACHINE\path\ValueName=regtype,data  (e.g. 4,0 = REG_DWORD 0)
 			valueName := k
@@ -774,12 +848,13 @@ func readPolWStr(data []byte, off int) (string, int) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Groups.xml parser — MS14-025
+// Groups.xml parser — MS14-025 cpasswords + GPP local group membership
 // ─────────────────────────────────────────────────────────────
 
 type groupsXML struct {
-	XMLName xml.Name    `xml:"Groups"`
-	Users   []groupUser `xml:"User"`
+	XMLName xml.Name     `xml:"Groups"`
+	Users   []groupUser  `xml:"User"`
+	Groups  []groupGroup `xml:"Group"`
 }
 type groupUser struct {
 	Properties groupUserProps `xml:"Properties"`
@@ -788,6 +863,23 @@ type groupUserProps struct {
 	UserName  string `xml:"userName,attr"`
 	CPassword string `xml:"cpassword,attr"`
 	Action    string `xml:"action,attr"`
+}
+type groupGroup struct {
+	Properties groupGroupProps `xml:"Properties"`
+}
+type groupGroupProps struct {
+	GroupName string          `xml:"groupName,attr"`
+	GroupSID  string          `xml:"groupSid,attr"`
+	Action   string          `xml:"action,attr"`
+	Members  groupMemberList `xml:"Members"`
+}
+type groupMemberList struct {
+	Members []groupMember `xml:"Member"`
+}
+type groupMember struct {
+	Name   string `xml:"name,attr"`
+	Action string `xml:"action,attr"`
+	SID    string `xml:"sid,attr"`
 }
 
 func parseGroupsXML(data []byte) []Finding {
@@ -805,6 +897,43 @@ func parseGroupsXML(data []byte) []Finding {
 				Description: "cpassword (MS14-025) — Groups.xml",
 				Detail:      fmt.Sprintf("username=%s cpassword=%s", p.UserName, p.CPassword),
 				Decrypted:   dec,
+			})
+		}
+	}
+	for _, g := range root.Groups {
+		p := g.Properties
+		if len(p.Members.Members) == 0 {
+			continue
+		}
+		groupName := p.GroupName
+		if groupName == "" && p.GroupSID != "" {
+			groupName = resolveSID(p.GroupSID)
+		}
+		if groupName == "" {
+			groupName = "(unknown group)"
+		}
+		sev := "INFO"
+		if p.GroupSID != "" && securityGroupSIDs[strings.ToUpper(p.GroupSID)] {
+			sev = "HIGH"
+		} else {
+			sidLower := strings.ToLower(groupName)
+			if strings.Contains(sidLower, "admin") || strings.Contains(sidLower, "s-1-5-32-544") {
+				sev = "HIGH"
+			}
+		}
+		for _, m := range p.Members.Members {
+			memberName := m.Name
+			if memberName == "" && m.SID != "" {
+				memberName = m.SID
+			}
+			action := strings.ToUpper(m.Action)
+			if action == "" {
+				action = "ADD"
+			}
+			findings = append(findings, Finding{
+				Severity:    sev,
+				Description: fmt.Sprintf("GPP Local Group: %s %s → %s", action, memberName, groupName),
+				Detail:      fmt.Sprintf("group=%s groupSid=%s member=%s memberSid=%s action=%s", p.GroupName, p.GroupSID, m.Name, m.SID, m.Action),
 			})
 		}
 	}
@@ -1377,7 +1506,7 @@ var interestingFiles = map[string]struct {
 	Label  string
 	Parser func([]byte) []Finding
 }{
-	"groups.xml":         {"Groups / Local Admins (MS14-025)", parseGroupsXML},
+	"groups.xml":         {"Groups / Local Admins (GPP + MS14-025)", parseGroupsXML},
 	"drives.xml":         {"Mapped Drives",                    parseDrivesXML},
 	"scheduledtasks.xml": {"Scheduled Tasks",                  parseScheduledTasksXML},
 	"services.xml":       {"Services (GPP)",                   parseServicesXML},
