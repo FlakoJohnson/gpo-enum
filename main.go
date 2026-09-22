@@ -686,7 +686,6 @@ type regEntry struct {
 var interestingRegPatterns = []string{
 	"autoadminlogon", "defaultpassword", "defaultusername",
 	"winrm", "wdigest", "lsass",
-	"disableantispyware", "disablerealtimemonitoring",
 }
 
 func parseRegistryPol(data []byte) []Finding {
@@ -721,6 +720,22 @@ func parseRegistryPol(data []byte) []Finding {
 					Detail:      fmt.Sprintf("%s\\%s = %s", e.Key, e.Value, e.Data),
 				})
 				break
+			}
+		}
+
+		if strings.Contains(kl, `windows defender`) && e.Data == "1" {
+			vl := strings.ToLower(e.Value)
+			switch vl {
+			case "disableantispyware":
+				findings = append(findings, Finding{Severity: "HIGH", Description: "Windows Defender disabled via Registry.pol (DisableAntiSpyware=1)", Detail: fmt.Sprintf("%s\\%s = %s", e.Key, e.Value, e.Data)})
+			case "disablerealtimemonitoring":
+				findings = append(findings, Finding{Severity: "HIGH", Description: "Defender real-time monitoring disabled via Registry.pol", Detail: fmt.Sprintf("%s\\%s = %s", e.Key, e.Value, e.Data)})
+			case "disablebehaviormonitoring":
+				findings = append(findings, Finding{Severity: "HIGH", Description: "Defender behavior monitoring disabled via Registry.pol", Detail: fmt.Sprintf("%s\\%s = %s", e.Key, e.Value, e.Data)})
+			case "disableioavprotection":
+				findings = append(findings, Finding{Severity: "HIGH", Description: "Defender IOAV protection disabled via Registry.pol", Detail: fmt.Sprintf("%s\\%s = %s", e.Key, e.Value, e.Data)})
+			case "disablescriptscanning":
+				findings = append(findings, Finding{Severity: "HIGH", Description: "Defender script scanning disabled via Registry.pol", Detail: fmt.Sprintf("%s\\%s = %s", e.Key, e.Value, e.Data)})
 			}
 		}
 	}
