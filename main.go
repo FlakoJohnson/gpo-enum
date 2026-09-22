@@ -1005,7 +1005,10 @@ func parseDrivesXML(data []byte) []Finding {
 type scheduledTasksXML struct {
 	XMLName xml.Name        `xml:"ScheduledTasks"`
 	Tasks   []scheduledTask `xml:"Task"`
+	TasksV2 []taskV2        `xml:"TaskV2"`
 }
+
+// Task (v1) — legacy GPP scheduled task
 type scheduledTask struct {
 	Properties taskProps `xml:"Properties"`
 }
@@ -1015,12 +1018,63 @@ type taskProps struct {
 	Command   string `xml:"appName,attr"`
 }
 
+// TaskV2 — modern GPP scheduled task (Windows Vista+)
+type taskV2 struct {
+	Name       string      `xml:"name,attr"`
+	Properties taskV2Props `xml:"Properties"`
+}
+type taskV2Props struct {
+	RunAs     string   `xml:"runAs,attr"`
+	LogonType string   `xml:"logonType,attr"`
+	Action    string   `xml:"action,attr"`
+	Name      string   `xml:"name,attr"`
+	Task      taskV2Inner `xml:"Task"`
+}
+type taskV2Inner struct {
+	Principals taskV2Principals `xml:"Principals"`
+	Actions    taskV2Actions    `xml:"Actions"`
+}
+type taskV2Principals struct {
+	Principal taskV2Principal `xml:"Principal"`
+}
+type taskV2Principal struct {
+	UserID   string `xml:"UserId"`
+	RunLevel string `xml:"RunLevel"`
+}
+type taskV2Actions struct {
+	Execs []taskV2Exec `xml:"Exec"`
+}
+type taskV2Exec struct {
+	Command          string `xml:"Command"`
+	Arguments        string `xml:"Arguments"`
+	WorkingDirectory string `xml:"WorkingDirectory"`
+}
+
+var writablePaths = []string{
+	`c:\programdata`,
+	`c:\temp`,
+	`c:\windows\temp`,
+	`c:\users\public`,
+}
+
+func isWritablePath(p string) bool {
+	pl := strings.ToLower(strings.ReplaceAll(p, "/", `\`))
+	for _, wp := range writablePaths {
+		if strings.HasPrefix(pl, wp) {
+			return true
+		}
+	}
+	return false
+}
+
 func parseScheduledTasksXML(data []byte) []Finding {
 	var findings []Finding
 	var root scheduledTasksXML
 	if err := xml.Unmarshal(data, &root); err != nil {
 		return findings
 	}
+
+	// v1 tasks
 	for _, t := range root.Tasks {
 		p := t.Properties
 		if p.CPassword != "" {
@@ -1042,6 +1096,72 @@ func parseScheduledTasksXML(data []byte) []Finding {
 					})
 					break
 				}
+			}
+		}
+	}
+
+	// v2 tasks
+	for _, t := range root.TasksV2 {
+		p := t.Properties
+		runAs := p.RunAs
+		if runAs == "" {
+			runAs = p.Task.Principals.Principal.UserID
+		}
+		runLevel := p.Task.Principals.Principal.RunLevel
+		taskName := t.Name
+		if taskName == "" {
+			taskName = p.Name
+		}
+
+		for _, exec := range p.Task.Actions.Execs {
+			cmd := exec.Command
+			args := exec.Arguments
+			fullCmd := strings.TrimSpace(cmd + " " + args)
+
+			sev := "INFO"
+			desc := fmt.Sprintf("GPP Scheduled Task: %s", taskName)
+
+			if strings.EqualFold(runLevel, "HighestAvailable") && runAs != "" {
+				sev = "HIGH"
+				desc = fmt.Sprintf("GPP Scheduled Task (HighestAvailable): %s → runs as %s", taskName, runAs)
+			} else if runAs != "" {
+				sev = "MEDIUM"
+				desc = fmt.Sprintf("GPP Scheduled Task: %s → runs as %s", taskName, runAs)
+			}
+
+			detail := fmt.Sprintf("runAs=%s runLevel=%s command=%s", runAs, runLevel, fullCmd)
+
+			findings = append(findings, Finding{
+				Severity:    sev,
+				Description: desc,
+				Detail:      detail,
+			})
+
+			// Check for writable script path
+			scriptPath := ""
+			if strings.Contains(strings.ToLower(args), "-file") {
+				parts := strings.Split(args, "\"")
+				for _, part := range parts {
+					part = strings.TrimSpace(part)
+					if part != "" && (strings.HasSuffix(strings.ToLower(part), ".ps1") ||
+						strings.HasSuffix(strings.ToLower(part), ".bat") ||
+						strings.HasSuffix(strings.ToLower(part), ".cmd") ||
+						strings.HasSuffix(strings.ToLower(part), ".vbs")) {
+						scriptPath = part
+						break
+					}
+				}
+			}
+			if scriptPath == "" && exec.WorkingDirectory != "" {
+				scriptPath = exec.WorkingDirectory
+			}
+
+			if scriptPath != "" && isWritablePath(scriptPath) {
+				findings = append(findings, Finding{
+					Severity:    "HIGH",
+					Description: fmt.Sprintf("Scheduled task script in user-writable path: %s", scriptPath),
+					Detail:      fmt.Sprintf("runAs=%s path=%s", runAs, scriptPath),
+				})
 			}
 		}
 	}
