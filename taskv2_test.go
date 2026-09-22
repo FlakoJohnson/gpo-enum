@@ -18,6 +18,14 @@ func TestParseScheduledTasksXML_TaskV2(t *testing.T) {
             <RunLevel>HighestAvailable</RunLevel>
           </Principal>
         </Principals>
+        <Triggers>
+          <BootTrigger>
+            <Enabled>true</Enabled>
+            <Delay>PT1M</Delay>
+            <Repetition><Interval>PT30M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>
+            <StartBoundary>2026-07-14T14:57:26</StartBoundary>
+          </BootTrigger>
+        </Triggers>
         <Actions Context="Author">
           <Exec>
             <Command>C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe</Command>
@@ -54,6 +62,9 @@ func TestParseScheduledTasksXML_TaskV2(t *testing.T) {
 			foundTask = true
 			if !strings.Contains(f.Detail, "powershell") {
 				t.Errorf("task detail should contain command: %s", f.Detail)
+			}
+			if !strings.Contains(f.Detail, "trigger=BootTrigger interval=PT30M") {
+				t.Errorf("task detail should contain trigger info: %s", f.Detail)
 			}
 			break
 		}

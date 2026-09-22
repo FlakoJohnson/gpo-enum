@@ -1032,7 +1032,24 @@ type taskV2Props struct {
 }
 type taskV2Inner struct {
 	Principals taskV2Principals `xml:"Principals"`
+	Triggers   taskV2Triggers   `xml:"Triggers"`
 	Actions    taskV2Actions    `xml:"Actions"`
+}
+type taskV2Triggers struct {
+	Boot     []taskV2Trigger `xml:"BootTrigger"`
+	Logon    []taskV2Trigger `xml:"LogonTrigger"`
+	Calendar []taskV2Trigger `xml:"CalendarTrigger"`
+	Idle     []taskV2Trigger `xml:"IdleTrigger"`
+	Time     []taskV2Trigger `xml:"TimeTrigger"`
+}
+type taskV2Trigger struct {
+	Enabled    string          `xml:"Enabled"`
+	Repetition taskV2Repetition `xml:"Repetition"`
+	Delay      string          `xml:"Delay"`
+	StartBoundary string       `xml:"StartBoundary"`
+}
+type taskV2Repetition struct {
+	Interval string `xml:"Interval"`
 }
 type taskV2Principals struct {
 	Principal taskV2Principal `xml:"Principal"`
@@ -1055,6 +1072,49 @@ var writablePaths = []string{
 	`c:\temp`,
 	`c:\windows\temp`,
 	`c:\users\public`,
+}
+
+func summarizeTriggers(tr taskV2Triggers) string {
+	var parts []string
+	for _, t := range tr.Boot {
+		s := "BootTrigger"
+		if t.Repetition.Interval != "" {
+			s += " interval=" + t.Repetition.Interval
+		}
+		parts = append(parts, s)
+	}
+	for _, t := range tr.Logon {
+		s := "LogonTrigger"
+		if t.Repetition.Interval != "" {
+			s += " interval=" + t.Repetition.Interval
+		}
+		parts = append(parts, s)
+	}
+	for _, t := range tr.Calendar {
+		s := "CalendarTrigger"
+		if t.Repetition.Interval != "" {
+			s += " interval=" + t.Repetition.Interval
+		}
+		parts = append(parts, s)
+	}
+	for _, t := range tr.Idle {
+		s := "IdleTrigger"
+		if t.Repetition.Interval != "" {
+			s += " interval=" + t.Repetition.Interval
+		}
+		parts = append(parts, s)
+	}
+	for _, t := range tr.Time {
+		s := "TimeTrigger"
+		if t.Repetition.Interval != "" {
+			s += " interval=" + t.Repetition.Interval
+		}
+		parts = append(parts, s)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, ", ")
 }
 
 func isWritablePath(p string) bool {
@@ -1129,7 +1189,11 @@ func parseScheduledTasksXML(data []byte) []Finding {
 				desc = fmt.Sprintf("GPP Scheduled Task: %s → runs as %s", taskName, runAs)
 			}
 
+			triggerInfo := summarizeTriggers(p.Task.Triggers)
 			detail := fmt.Sprintf("runAs=%s runLevel=%s command=%s", runAs, runLevel, fullCmd)
+			if triggerInfo != "" {
+				detail += " trigger=" + triggerInfo
+			}
 
 			findings = append(findings, Finding{
 				Severity:    sev,
