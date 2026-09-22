@@ -110,6 +110,7 @@ type opts struct {
 	Policy       string // target a single GPO by GUID or display name
 	All          bool
 	Verbose      bool
+	NoSave       bool
 }
 
 // sysvol returns the domain used for SYSVOL path and LDAP base DN.
@@ -142,6 +143,7 @@ func parseArgs() opts {
 	flag.StringVar(&o.Policy,       "policy",        "",    "Enumerate only this GPO (GUID or display name, case-insensitive)")
 	flag.BoolVar  (&o.All,          "all",           false, "Show GPOs with no findings")
 	flag.BoolVar  (&o.Verbose,      "v",             false, "Verbose output")
+	flag.BoolVar  (&o.NoSave,       "no-save",       false, "Print to console only — skip output directory, report files, and SYSVOL collection")
 	flag.Parse()
 	// Permute args so flags work in any position. Go's flag package stops at the
 	// first non-flag arg, so `gpo-enum ... <DC> -proxy URL` would silently drop
@@ -154,7 +156,7 @@ func parseArgs() opts {
 		}
 	}
 	if len(positionals) < 1 || o.Domain == "" || o.Username == "" {
-		fmt.Fprintln(os.Stderr, "usage: gpo-enum -u USER -p PASS -d DOMAIN [-target-domain DOMAIN] [-H LM:NT] [-k] [-dc-ip IP] [-proxy URL] [-o FILE] [-policy NAME|GUID] [-all] [-v] <DC>")
+		fmt.Fprintln(os.Stderr, "usage: gpo-enum -u USER -p PASS -d DOMAIN [-target-domain DOMAIN] [-H LM:NT] [-k] [-dc-ip IP] [-proxy URL] [-o FILE] [-policy NAME|GUID] [-all] [-v] [-no-save] <DC>")
 		os.Exit(1)
 	}
 	o.DC = positionals[0]
@@ -1722,6 +1724,9 @@ var scriptExts = map[string]bool{
 
 // collectFile saves raw SYSVOL file bytes to outDir/sysvol/<smbPath>.
 func collectFile(outDir, smbPath string, data []byte) {
+	if outDir == "" {
+		return
+	}
 	clean := strings.ReplaceAll(strings.ReplaceAll(smbPath, "\\", "/"), " ", "_")
 	local := filepath.Join(outDir, "sysvol", filepath.FromSlash(clean))
 	if err := os.MkdirAll(filepath.Dir(local), 0755); err != nil {
@@ -1979,33 +1984,36 @@ func main() {
 	}
 
 	// ── Output directory setup
-	outDir := o.Outfile
-	if outDir == "" {
-		outDir = "gpo-enum_" + stamp
-	}
-	if err := os.MkdirAll(outDir, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, cRed+"[-]"+cReset+" Cannot create output dir: %v\n", err)
-		os.Exit(1)
-	}
+	outDir := ""
+	if !o.NoSave {
+		outDir = o.Outfile
+		if outDir == "" {
+			outDir = "gpo-enum_" + stamp
+		}
+		if err := os.MkdirAll(outDir, 0755); err != nil {
+			fmt.Fprintf(os.Stderr, cRed+"[-]"+cReset+" Cannot create output dir: %v\n", err)
+			os.Exit(1)
+		}
 
-	// Tee stdout → report.txt (captures full console output including progress)
-	reportPath := filepath.Join(outDir, "report.txt")
-	logFile, logErr := os.Create(reportPath)
-	if logErr == nil {
-		pipeR, pipeW, pipeErr := os.Pipe()
-		if pipeErr == nil {
-			origStdout := os.Stdout
-			os.Stdout = pipeW
-			teeDone := make(chan struct{})
-			go func() {
-				io.Copy(io.MultiWriter(origStdout, logFile), pipeR)
-				close(teeDone)
-			}()
-			defer func() {
-				pipeW.Close()
-				<-teeDone
-				logFile.Close()
-			}()
+		// Tee stdout → report.txt (captures full console output including progress)
+		reportPath := filepath.Join(outDir, "report.txt")
+		logFile, logErr := os.Create(reportPath)
+		if logErr == nil {
+			pipeR, pipeW, pipeErr := os.Pipe()
+			if pipeErr == nil {
+				origStdout := os.Stdout
+				os.Stdout = pipeW
+				teeDone := make(chan struct{})
+				go func() {
+					io.Copy(io.MultiWriter(origStdout, logFile), pipeR)
+					close(teeDone)
+				}()
+				defer func() {
+					pipeW.Close()
+					<-teeDone
+					logFile.Close()
+				}()
+			}
 		}
 	}
 
@@ -2032,7 +2040,9 @@ func main() {
 	fmt.Printf("  %s%sDomain%s  : %s\n", cBold, cWhite, cReset, o.sysvol())
 	fmt.Printf("  %s%sUser%s    : %s\\%s\n", cBold, cWhite, cReset, o.Domain, o.Username)
 	fmt.Printf("  %s%sAuth%s    : %s\n", cBold, cWhite, cReset, authMethod)
-	fmt.Printf("  %s%sOutput%s  : %s\n", cBold, cWhite, cReset, outDir)
+	if !o.NoSave {
+		fmt.Printf("  %s%sOutput%s  : %s\n", cBold, cWhite, cReset, outDir)
+	}
 	fmt.Printf("  %s%sStarted%s : %s\n", cBold, cWhite, cReset, ts)
 	fmt.Println()
 
@@ -2145,20 +2155,22 @@ func main() {
 	// ── Print report (also captured to report.txt via tee)
 	printReport(results, o.All)
 
-	// ── Save report.json
-	jsonPath := filepath.Join(outDir, "report.json")
-	if jf, err := os.Create(jsonPath); err == nil {
-		enc := json.NewEncoder(jf)
-		enc.SetIndent("", "  ")
-		_ = enc.Encode(results)
-		jf.Close()
+	if !o.NoSave {
+		// ── Save report.json
+		jsonPath := filepath.Join(outDir, "report.json")
+		if jf, err := os.Create(jsonPath); err == nil {
+			enc := json.NewEncoder(jf)
+			enc.SetIndent("", "  ")
+			_ = enc.Encode(results)
+			jf.Close()
+		}
+
+		// ── Save summary.txt (findings only, no progress noise)
+		summaryPath := filepath.Join(outDir, "summary.txt")
+		writeSummary(summaryPath, results, o.DC, o.sysvol(), o.Username, ts)
+
+		good("Output saved → %s/", outDir)
 	}
-
-	// ── Save summary.txt (findings only, no progress noise)
-	summaryPath := filepath.Join(outDir, "summary.txt")
-	writeSummary(summaryPath, results, o.DC, o.sysvol(), o.Username, ts)
-
-	good("Output saved → %s/", outDir)
 }
 
 func writeSummary(path string, results []GPOResult, target, domain, user, ts string) {
